@@ -104,7 +104,7 @@ Disk
 - Validator sunucunuzda çalıştırın. Token, Chat ID ve mesajlarda görünecek ismi soracak.
 - İsim kısmına IP veya şehir yazmayın. Birden fazla sunucunuz varsa `Nako-Mainnet`, `Nako-Mocha` gibi ayırt edici isimler verin.
 ```
-curl -s https://raw.githubusercontent.com/okannako/celestiawatch/main/celestiawatchtr.sh > celestiawatchtr.sh && chmod +x celestiawatchtr.sh && sudo ./celestiawatchtr.sh install
+curl -s https://raw.githubusercontent.com/okannako/celestiawatchtr/refs/heads/main/celestiawatchtr.sh > celestiawatchtr.sh && chmod +x celestiawatchtr.sh && sudo ./celestiawatchtr.sh install
 ```
 
 - Kurulum bitince Telegram'a bir deneme mesajı gelir.
