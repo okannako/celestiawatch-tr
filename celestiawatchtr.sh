@@ -11,7 +11,7 @@
 #     Bu kullanıcı /root ve /home klasörlerini göremez (anahtarlarınıza erişemez).
 #
 #  KOMUTLAR
-#   sudo ./celestiawatch.sh install     Kurulum (soru sorar, servis + zamanlayıcı kurar)
+#   sudo ./celestiawatchtr.sh install     Kurulum (soru sorar, servis + zamanlayıcı kurar)
 #   sudo celestiawatch uninstall        Tamamen kaldırır
 #   sudo celestiawatch doctor           Ayrıntılı tek seferlik kontrol raporu (ekrana)
 #   celestiawatch status                Anlık durum özeti (ekrana)
@@ -19,11 +19,11 @@
 #   celestiawatch watch                 Servisin dakikada bir çalıştırdığı kontrol
 # =====================================================================
 set -u
-VERSION="1.0.0"
+VERSION="1.1.0"
 CONFIG_FILE="${CELESTIAWATCH_CONFIG:-/etc/celestiawatch/config.env}"
 STATE_DIR="${STATE_DIRECTORY:-/var/lib/celestiawatch}"
 
-# ---------- Varsayılan ayarlar (config.env bunları egale eder) ----------
+# ---------- Varsayılan ayarlar (config.env bunları ezer) ----------
 RPC="http://127.0.0.1:26657"
 TELEGRAM_TOKEN=""
 TELEGRAM_CHAT_ID=""
@@ -40,6 +40,7 @@ STALL_MINUTES=3                 # Blok yüksekliği bu kadar dakika ilerlemezse 
 REMIND_MINUTES=60               # Devam eden sorunları bu aralıkla hatırlat
 DAILY_REPORT_HOUR=""            # Örn. 9 -> her gün 09:00'dan sonra bir durum özeti
 MAX_BLOCKS_PER_RUN=50
+MODE=""                         # Boş = otomatik (validator veya bridge)
 DRY_RUN=0                       # 1 ise mesajları yollamaz, ekrana yazar
 
 if [ -r "$CONFIG_FILE" ]; then
@@ -101,10 +102,34 @@ exposed_ports() {
 
 port_listening() { need ss && ss -Hltn "sport = :$1" 2>/dev/null | grep -q .; }
 
+detect_mode() {
+  [ -n "$MODE" ] && return
+  if service_exists "$APP_SERVICE"; then MODE=validator
+  elif service_exists "$BRIDGE_SERVICE"; then MODE=bridge
+  else MODE=validator; fi
+}
+
+# Bridge: son bloklar servis loglarındaki "new head" satırlarından okunur (sadece okuma)
+collect_bridge() {
+  BHEAD=""; JOURNAL_OK=0; BNET="celestia"; BUPTIME=999999
+  systemctl cat "$BRIDGE_SERVICE" 2>/dev/null | grep -q -- '--p2p.network mocha' && BNET=mocha
+  journalctl -u "$BRIDGE_SERVICE" -n 1 -o cat --no-pager 2>/dev/null | grep -q . && JOURNAL_OK=1
+  BHEAD=$(journalctl -u "$BRIDGE_SERVICE" --since "-${STALL_MINUTES} min" -o cat --no-pager 2>/dev/null |
+    grep 'new head' | tail -1 | grep -oE '"height": ?[0-9]+' | grep -oE '[0-9]+$')
+  local ts; ts=$(systemctl show "$BRIDGE_SERVICE" -p ActiveEnterTimestamp --value 2>/dev/null)
+  [ -n "$ts" ] && BUPTIME=$(( $(now) - $(date -d "$ts" +%s 2>/dev/null || echo 0) ))
+}
+
 disk_usage() { df -P "$1" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}'; }
 
 # ---------- Ortak veri toplama ----------
 collect() {
+  detect_mode
+  if [ "$MODE" = "bridge" ]; then
+    RPC_OK=0; HEIGHT=""; CATCHING=""; NETWORK=""; VAL_ADDR=""; VP=""; PEERS=""; APPV=""
+    collect_bridge
+    return
+  fi
   STATUS_JSON=$(rpc status)
   RPC_OK=0; HEIGHT=""; CATCHING=""; NETWORK=""; VAL_ADDR=""; VP=""; PEERS=""; APPV=""
   if [ -n "$STATUS_JSON" ] && echo "$STATUS_JSON" | jq -e .result >/dev/null 2>&1; then
@@ -140,7 +165,14 @@ count_missed() {
 
 summary_text() {
   local s="📊 Durum"$'\n'
-  if [ "$RPC_OK" = 1 ]; then
+  if [ "$MODE" = "bridge" ]; then
+    if [ -n "$BHEAD" ]; then s+="Bridge ($BNET): son blok $BHEAD"
+    elif [ "$JOURNAL_OK" = 1 ]; then s+="Bridge ($BNET): son $STALL_MINUTES dakikada yeni blok YOK"
+    else s+="Bridge ($BNET): log okunamadı"; fi
+    s+=$'\n'
+    if port_listening 2121; then s+="P2P 2121: dinleniyor"; else s+="P2P 2121: DİNLENMİYOR"; fi
+    s+=$'\n'
+  elif [ "$RPC_OK" = 1 ]; then
     local sync="evet"; [ "$CATCHING" = "true" ] && sync="HAYIR (yakalıyor)"
     local set="aktif sette"; [ "${VP:-0}" = "0" ] && set="aktif sette DEĞİL"
     s+="Ağ: $NETWORK | Blok: $HEIGHT | Senkron: $sync"$'\n'
@@ -180,7 +212,14 @@ cmd_watch() {
 
   collect
 
-  if [ "$RPC_OK" != 1 ]; then
+  if [ "$MODE" = "bridge" ]; then
+    if [ "$JOURNAL_OK" = 1 ] && [ -z "$BHEAD" ] && service_active "$BRIDGE_SERVICE" && [ "$BUPTIME" -gt $((STALL_MINUTES * 60 + 60)) ]; then
+      issue bstall "Bridge son $STALL_MINUTES dakikadır yeni blok almıyor."
+    fi
+    if service_active "$BRIDGE_SERVICE" && ! port_listening 2121; then
+      issue bp2p "Bridge çalışıyor ama P2P portu 2121'i dinlemiyor."
+    fi
+  elif [ "$RPC_OK" != 1 ]; then
     issue rpc "Node RPC yanıt vermiyor. celestia-appd çalışıyor mu?"
     # RPC yokken zincir kontrolleri yapılamaz; önceki sorunlar "düzeldi" sayılmasın.
     for k in sync stall peers inactive missed; do
@@ -286,6 +325,14 @@ cmd_doctor() {
   echo; echo "celestiawatch doctor v$VERSION  (sadece okur, hiçbir şeyi değiştirmez)"; echo
   collect
 
+  if [ "$MODE" = "bridge" ]; then
+    echo "Bridge"
+    if [ -n "$BHEAD" ]; then ok "Yeni bloklar geliyor (son blok $BHEAD, ağ: $BNET)"
+    elif [ "$JOURNAL_OK" = 1 ]; then bad "Son $STALL_MINUTES dakikada yeni blok yok"
+    else warn "Bridge logları okunamadı (sudo ile çalıştırın)"; fi
+    port_listening 2121 && ok "P2P portu 2121 dinleniyor" || bad "P2P portu 2121 dinlenmiyor"
+    if systemctl cat "$BRIDGE_SERVICE" 2>/dev/null | grep -q -- '--archival'; then info "Archival mod: açık"; else info "Archival mod: kapalı (pruned)"; fi
+  else
   echo "Node"
   if [ "$RPC_OK" = 1 ]; then
     ok "RPC yanıt veriyor ($RPC)"
@@ -296,6 +343,7 @@ cmd_doctor() {
   else
     bad "RPC yanıt vermiyor ($RPC)"
   fi
+  fi
 
   echo; echo "Servisler"
   for svc in "$APP_SERVICE" "$FIBRE_SERVICE" "$BRIDGE_SERVICE"; do
@@ -304,8 +352,23 @@ cmd_doctor() {
     service_active "$svc" && ok "$svc çalışıyor" || bad "$svc çalışmıyor"
   done
 
+  local appd_bin=""
+  if [ "$MODE" = "bridge" ]; then
+    echo; echo "Sürümler"
+    local ncur nlatest nfilter='^v[0-9]+\.[0-9]+\.[0-9]+$'
+    [ "$BNET" = "mocha" ] && nfilter='^v[0-9]+\.[0-9]+\.[0-9]+-mocha$'
+    ncur=$(celestia version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+)?' | head -1)
+    info "celestia-node: ${ncur:-?}"
+    nlatest=$(curl -s --max-time 10 -H "User-Agent: celestiawatch" "https://api.github.com/repos/celestiaorg/celestia-node/releases?per_page=60" |
+      jq -r --arg f "$nfilter" '[.[] | select(.draft==false) | .tag_name | select(test($f))] | sort_by(ltrimstr("v") | split("-")[0] | split(".") | map(tonumber)) | last // empty' 2>/dev/null)
+    if [ -n "$nlatest" ]; then
+      if [ "$ncur" = "$nlatest" ]; then ok "En güncel sürüm kullanılıyor ($nlatest)"; else warn "Son yayınlanan sürüm: $nlatest (sizde: ${ncur:-?})"; fi
+    else
+      info "Son sürüm bilgisi alınamadı"
+    fi
+  else
   echo; echo "Sürümler"
-  local appd_bin; appd_bin=$(command -v celestia-appd || ls /root/go/bin/celestia-appd 2>/dev/null || true)
+  appd_bin=$(command -v celestia-appd || ls /root/go/bin/celestia-appd 2>/dev/null || true)
   local cur=""
   if [ -n "$appd_bin" ]; then cur=$("$appd_bin" version 2>/dev/null | head -1); info "celestia-appd: ${cur:-?}"; else info "celestia-appd bulunamadı"; fi
   need fibre && info "fibre: $(fibre version 2>/dev/null | head -1)"
@@ -317,6 +380,8 @@ cmd_doctor() {
     if [ "v${cur#v}" = "$latest" ]; then ok "En güncel sürüm kullanılıyor ($latest)"; else warn "Son yayınlanan sürüm: $latest (sizde: ${cur:-?})"; fi
   else
     info "Son sürüm bilgisi alınamadı"
+  fi
+
   fi
 
   if ! service_exists "$FIBRE_SERVICE"; then
@@ -377,7 +442,7 @@ cmd_test() {
 
 # ---------- install / uninstall ----------
 cmd_install() {
-  [ "$(id -u)" = "0" ] || { echo "Kurulum için: sudo ./celestiawatch.sh install"; exit 1; }
+  [ "$(id -u)" = "0" ] || { echo "Kurulum için: sudo ./celestiawatchtr.sh install"; exit 1; }
   echo "celestiawatch kurulumu. Bu araç node ayarlarınıza dokunmaz, sadece okur."
   local missing=""
   for c in curl jq ss flock systemctl; do need "$c" || missing+=" $c"; done
@@ -431,6 +496,7 @@ After=network-online.target
 Type=oneshot
 User=celestiawatch
 Group=celestiawatch
+SupplementaryGroups=systemd-journal
 ExecStart=/usr/local/bin/celestiawatch watch
 StateDirectory=celestiawatch
 TimeoutStartSec=50
